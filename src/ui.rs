@@ -1,5 +1,6 @@
 use std::{
     sync::Arc,
+    sync::mpsc,
     time::{Duration, Instant},
 };
 
@@ -34,9 +35,18 @@ pub struct HungerApp {
     settings_dirty: bool,
     graph_mode: GraphColorMode,
     backfill_status: BackfillStatus,
+    refresh_in_flight: bool,
+    refresh_rx: Option<mpsc::Receiver<RefreshPayload>>,
+    reload_requested: bool,
     last_refresh: Instant,
     status_line: String,
     quick_seed: String,
+}
+
+struct RefreshPayload {
+    dashboard: anyhow::Result<DashboardSnapshot>,
+    settings_snapshot: SettingsSnapshot,
+    backfill_status: BackfillStatus,
 }
 
 impl HungerApp {
@@ -53,6 +63,9 @@ impl HungerApp {
             settings_dirty: false,
             graph_mode: GraphColorMode::Novelty,
             backfill_status: context.runtime.block_on(context.backfill.snapshot()),
+            refresh_in_flight: false,
+            refresh_rx: None,
+            reload_requested: false,
             settings_snapshot,
             dashboard,
             context,
@@ -63,28 +76,61 @@ impl HungerApp {
         }
     }
 
-    fn refresh(&mut self) {
-        match self
-            .context
-            .runtime
-            .block_on(self.context.database.snapshot())
-        {
-            Ok(snapshot) => {
-                self.dashboard = snapshot;
-            }
-            Err(error) => {
-                self.status_line = format!("Snapshot failed: {error}");
-            }
+    fn request_refresh(&mut self) {
+        if self.refresh_in_flight {
+            return;
         }
 
-        self.settings_snapshot = self
-            .context
-            .runtime
-            .block_on(self.context.settings.snapshot());
-        self.backfill_status = self
-            .context
-            .runtime
-            .block_on(self.context.backfill.snapshot());
+        let (tx, rx) = mpsc::channel();
+        let database = self.context.database.clone();
+        let settings = self.context.settings.clone();
+        let backfill = self.context.backfill.clone();
+        self.context.runtime.spawn(async move {
+            let payload = RefreshPayload {
+                dashboard: database.snapshot().await,
+                settings_snapshot: settings.snapshot().await,
+                backfill_status: backfill.snapshot().await,
+            };
+            let _ = tx.send(payload);
+        });
+
+        self.refresh_in_flight = true;
+        self.refresh_rx = Some(rx);
+    }
+
+    fn poll_refresh(&mut self) {
+        let Some(receiver) = &self.refresh_rx else {
+            return;
+        };
+
+        match receiver.try_recv() {
+            Ok(payload) => {
+                self.refresh_in_flight = false;
+                self.refresh_rx = None;
+
+                match payload.dashboard {
+                    Ok(snapshot) => {
+                        self.dashboard = snapshot;
+                    }
+                    Err(error) => {
+                        self.status_line = format!("Snapshot failed: {error}");
+                    }
+                }
+                self.settings_snapshot = payload.settings_snapshot;
+                self.backfill_status = payload.backfill_status;
+                if self.reload_requested {
+                    self.editable_settings = self.settings_snapshot.settings.clone();
+                    self.settings_dirty = false;
+                    self.reload_requested = false;
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.refresh_in_flight = false;
+                self.refresh_rx = None;
+                self.status_line = "Snapshot refresh disconnected.".to_string();
+            }
+        }
     }
 
     fn save_settings(&mut self) {
@@ -114,7 +160,7 @@ impl HungerApp {
                     self.status_line =
                         format!("Settings saved, but enqueuing seeds failed: {error}");
                 }
-                self.refresh();
+                self.request_refresh();
             }
             Err(error) => {
                 self.status_line = format!("Saving settings failed: {error}");
@@ -141,7 +187,7 @@ impl HungerApp {
             Ok(()) => {
                 self.quick_seed.clear();
                 self.status_line = format!("Queued seed: {trimmed}");
-                self.refresh();
+                self.request_refresh();
             }
             Err(error) => {
                 self.status_line = format!("Queueing seed failed: {error}");
@@ -158,6 +204,7 @@ impl HungerApp {
         if started {
             self.status_line = "Started semantic backfill.".to_string();
             self.backfill_status.running = true;
+            self.request_refresh();
         } else {
             self.status_line = "Semantic backfill is already running.".to_string();
         }
@@ -192,7 +239,7 @@ impl HungerApp {
                     }
 
                     if ui.button("REFRESH").clicked() {
-                        self.refresh();
+                        self.request_refresh();
                     }
                     let backfill_button = egui::Button::new(if self.backfill_status.running {
                         "BACKFILL RUNNING"
@@ -404,9 +451,8 @@ impl HungerApp {
                     self.save_settings();
                 }
                 if ui.button("RELOAD").clicked() {
-                    self.refresh();
-                    self.editable_settings = self.settings_snapshot.settings.clone();
-                    self.settings_dirty = false;
+                    self.reload_requested = true;
+                    self.request_refresh();
                     self.status_line = "Reloaded saved settings.".to_string();
                 }
             });
@@ -458,7 +504,6 @@ impl HungerApp {
 
     fn draw_command_panel(&self, ui: &mut egui::Ui, telemetry: &FieldTelemetry) {
         panel_frame(Color32::from_rgb(9, 13, 20)).show(ui, |ui| {
-            ui.label(section_title("Command Radar"));
             draw_command_radar(ui, telemetry, &self.backfill_status);
         });
     }
@@ -494,8 +539,9 @@ impl HungerApp {
 
 impl eframe::App for HungerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_refresh();
         if self.last_refresh.elapsed() >= Duration::from_millis(900) {
-            self.refresh();
+            self.request_refresh();
             self.last_refresh = Instant::now();
         }
 
@@ -795,14 +841,7 @@ fn draw_command_radar(ui: &mut egui::Ui, telemetry: &FieldTelemetry, status: &Ba
     }
 
     painter.text(
-        rect.left_top() + egui::vec2(12.0, 12.0),
-        egui::Align2::LEFT_TOP,
-        "MAGI TELEMETRY",
-        egui::FontId::proportional(18.0),
-        Color32::from_rgb(239, 243, 247),
-    );
-    painter.text(
-        rect.left_top() + egui::vec2(12.0, 34.0),
+        rect.left_top() + egui::vec2(12.0, 14.0),
         egui::Align2::LEFT_TOP,
         format!(
             "mode={}  coverage={}/{}  resonance={}",

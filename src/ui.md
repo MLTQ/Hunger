@@ -12,7 +12,7 @@ Provides the native egui desktop application for inspecting the live crawl graph
 ### `HungerApp`
 - **Does**: Owns the native dashboard state, settings editor, pause button, and live snapshot refresh loop.
 - **Interacts with**: `Database::snapshot` in `db.rs`, `SettingsManager` in `settings.rs`, `RuntimeControl` in `control.rs`, `GraphViewport` in `graph_view.rs`
-- **Rationale**: Keeps in-progress settings edits separate from the polled persisted snapshot so the refresh loop does not overwrite typed changes.
+- **Rationale**: Keeps in-progress settings edits separate from the polled persisted snapshot so the refresh loop does not overwrite typed changes, and now polls snapshots asynchronously so long SQLite reads/writes do not freeze the egui thread.
 
 ### `HungerApp::draw_top_bar`, `draw_side_panel`, `draw_center`
 - **Does**: Splits the operator console into transport controls, graph analysis mode selection, semantic backfill controls, settings, graph viewport, and live lists.
@@ -24,7 +24,7 @@ Provides the native egui desktop application for inspecting the live crawl graph
 - **Interacts with**: `DashboardSnapshot` in `models.rs`, egui painter APIs
 
 ### `draw_command_panel`
-- **Does**: Renders a dedicated MAGI-style telemetry/radar panel from the graph viewport’s active-mode summary.
+- **Does**: Renders a dedicated telemetry/radar panel from the graph viewport’s active-mode summary.
 - **Interacts with**: `FieldTelemetry` in `graph_view.rs`, `BackfillStatus` in `backfill.rs`
 
 ### `draw_page_card`
