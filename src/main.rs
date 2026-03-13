@@ -1,0 +1,17 @@
+use anyhow::Result;
+use hunger::{app, config::Config};
+use tracing_subscriber::EnvFilter;
+
+fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info,hunger=debug")),
+        )
+        .with_target(false)
+        .compact()
+        .init();
+
+    let config = Config::from_env()?;
+    app::run(config)
+}
