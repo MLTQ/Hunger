@@ -7,13 +7,14 @@ use std::{
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke};
 use glam::{Quat, Vec3};
 
-use crate::models::{DashboardSnapshot, PageRecord};
+use crate::models::{DashboardSnapshot, PageRecord, SemanticAxis};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum GraphColorMode {
     Novelty,
     PageSemantic,
     JudgmentSemantic,
+    AxisProjection,
 }
 
 impl Default for GraphColorMode {
@@ -23,13 +24,19 @@ impl Default for GraphColorMode {
 }
 
 impl GraphColorMode {
-    pub const ALL: [Self; 3] = [Self::Novelty, Self::PageSemantic, Self::JudgmentSemantic];
+    pub const ALL: [Self; 4] = [
+        Self::Novelty,
+        Self::PageSemantic,
+        Self::JudgmentSemantic,
+        Self::AxisProjection,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Novelty => "NOVELTY",
             Self::PageSemantic => "PAGE SEM",
             Self::JudgmentSemantic => "LLM SEM",
+            Self::AxisProjection => "AXES",
         }
     }
 
@@ -38,6 +45,7 @@ impl GraphColorMode {
             Self::Novelty => "hyperlink topology + novelty heat",
             Self::PageSemantic => "content embeddings // semantic clusters",
             Self::JudgmentSemantic => "llm judgment embeddings // response resonance",
+            Self::AxisProjection => "operator-defined semantic axes // llm projection",
         }
     }
 }
@@ -115,17 +123,31 @@ impl Default for GraphViewport {
 }
 
 impl GraphViewport {
-    pub fn draw(&mut self, ui: &mut egui::Ui, snapshot: &DashboardSnapshot, mode: GraphColorMode) {
+    pub fn draw(
+        &mut self,
+        ui: &mut egui::Ui,
+        snapshot: &DashboardSnapshot,
+        mode: GraphColorMode,
+        semantic_axes: &[SemanticAxis],
+    ) {
         let available = ui.available_size();
         let desired = egui::vec2(available.x.max(480.0), available.y.max(320.0));
         let (rect, response) = ui.allocate_exact_size(desired, Sense::drag());
         self.handle_input(ui, &response);
         self.sync_nodes(snapshot);
         let semantic_state = self.semantic_state(snapshot, mode);
-        self.step_layout(snapshot, mode, &semantic_state);
-        self.telemetry = build_field_telemetry(snapshot, mode, &semantic_state);
+        self.step_layout(snapshot, mode, &semantic_state, semantic_axes);
+        self.telemetry = build_field_telemetry(snapshot, mode, &semantic_state, semantic_axes);
         let hover_pos = response.hover_pos();
-        self.paint(ui, rect, snapshot, hover_pos, mode, &semantic_state);
+        self.paint(
+            ui,
+            rect,
+            snapshot,
+            hover_pos,
+            mode,
+            &semantic_state,
+            semantic_axes,
+        );
     }
 
     pub fn telemetry(&self) -> FieldTelemetry {
@@ -155,6 +177,7 @@ impl GraphViewport {
         snapshot: &DashboardSnapshot,
         mode: GraphColorMode,
         semantic_state: &SemanticState,
+        semantic_axes: &[SemanticAxis],
     ) {
         let now = Instant::now();
         let dt = (now - self.last_tick).as_secs_f32().clamp(0.008, 0.033);
@@ -225,8 +248,19 @@ impl GraphViewport {
             }
         }
 
-        if mode != GraphColorMode::Novelty {
+        if matches!(
+            mode,
+            GraphColorMode::PageSemantic | GraphColorMode::JudgmentSemantic
+        ) {
             apply_semantic_forces(semantic_state, &url_to_index, &positions, &mut forces, mode);
+        } else if mode == GraphColorMode::AxisProjection {
+            apply_axis_projection_forces(
+                snapshot,
+                semantic_axes,
+                &url_to_index,
+                &positions,
+                &mut forces,
+            );
         }
 
         for (index, force) in forces.iter_mut().enumerate() {
@@ -292,6 +326,7 @@ impl GraphViewport {
         hover_pos: Option<Pos2>,
         mode: GraphColorMode,
         semantic_state: &SemanticState,
+        semantic_axes: &[SemanticAxis],
     ) {
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, Color32::from_rgb(5, 8, 15));
@@ -356,7 +391,10 @@ impl GraphViewport {
             );
         }
 
-        if mode != GraphColorMode::Novelty {
+        if matches!(
+            mode,
+            GraphColorMode::PageSemantic | GraphColorMode::JudgmentSemantic
+        ) {
             draw_semantic_resonance(&painter, &projection_by_url, semantic_state, mode);
         }
 
@@ -400,7 +438,10 @@ impl GraphViewport {
             Color32::from_rgb(111, 138, 160),
         );
 
-        if mode != GraphColorMode::Novelty {
+        if matches!(
+            mode,
+            GraphColorMode::PageSemantic | GraphColorMode::JudgmentSemantic
+        ) {
             painter.text(
                 rect.right_top() + egui::vec2(-18.0, 18.0),
                 egui::Align2::RIGHT_TOP,
@@ -412,10 +453,18 @@ impl GraphViewport {
                 egui::FontId::monospace(11.0),
                 Color32::from_rgb(255, 193, 106),
             );
+        } else if mode == GraphColorMode::AxisProjection {
+            painter.text(
+                rect.right_top() + egui::vec2(-18.0, 18.0),
+                egui::Align2::RIGHT_TOP,
+                axis_overlay_label(semantic_axes),
+                egui::FontId::monospace(11.0),
+                Color32::from_rgb(255, 193, 106),
+            );
         }
 
         if let Some(hovered) = hovered {
-            draw_tooltip(ui.ctx(), hovered, mode, semantic_state);
+            draw_tooltip(ui.ctx(), hovered, mode, semantic_state, semantic_axes);
         }
     }
 
@@ -502,6 +551,7 @@ fn build_field_telemetry(
     snapshot: &DashboardSnapshot,
     mode: GraphColorMode,
     semantic_state: &SemanticState,
+    semantic_axes: &[SemanticAxis],
 ) -> FieldTelemetry {
     let mut cluster_counts = HashMap::<usize, usize>::new();
     for cluster in semantic_state.clusters.values() {
@@ -536,8 +586,14 @@ fn build_field_telemetry(
     FieldTelemetry {
         mode,
         total_nodes: snapshot.graph_nodes.len(),
-        coverage: semantic_state.coverage,
-        resonance_links: semantic_state.resonance_pairs.len(),
+        coverage: match mode {
+            GraphColorMode::AxisProjection => axis_projection_coverage(snapshot, semantic_axes),
+            _ => semantic_state.coverage,
+        },
+        resonance_links: match mode {
+            GraphColorMode::AxisProjection => 0,
+            _ => semantic_state.resonance_pairs.len(),
+        },
         average_energy: if snapshot.graph_nodes.is_empty() {
             0.0
         } else {
@@ -555,7 +611,7 @@ fn semantic_vectors(snapshot: &DashboardSnapshot, mode: GraphColorMode) -> Vec<(
         .iter()
         .filter_map(|page| {
             let vector = match mode {
-                GraphColorMode::Novelty => None,
+                GraphColorMode::Novelty | GraphColorMode::AxisProjection => None,
                 GraphColorMode::PageSemantic => page.embedding.as_ref(),
                 GraphColorMode::JudgmentSemantic => page.llm_embedding.as_ref(),
             }?;
@@ -570,6 +626,77 @@ fn semantic_vectors(snapshot: &DashboardSnapshot, mode: GraphColorMode) -> Vec<(
         .collect()
 }
 
+fn apply_axis_projection_forces(
+    snapshot: &DashboardSnapshot,
+    semantic_axes: &[SemanticAxis],
+    url_to_index: &HashMap<&str, usize>,
+    positions: &[Vec3],
+    forces: &mut [Vec3],
+) {
+    for page in &snapshot.pages {
+        let Some(target) = axis_target_position(page, semantic_axes) else {
+            continue;
+        };
+        let Some(&index) = url_to_index.get(page.url.as_str()) else {
+            continue;
+        };
+
+        forces[index] += (target - positions[index]) * 0.68;
+    }
+}
+
+fn axis_target_position(page: &PageRecord, semantic_axes: &[SemanticAxis]) -> Option<Vec3> {
+    if semantic_axes.is_empty() {
+        return None;
+    }
+
+    let llm = page.llm_novelty.as_ref()?;
+    let x = score_for_axis(&llm.axis_scores, semantic_axes.first()?)?;
+    let y = if let Some(axis) = semantic_axes.get(1) {
+        score_for_axis(&llm.axis_scores, axis)?
+    } else {
+        page.food_energy * 2.0 - 1.0
+    };
+    let z = if let Some(axis) = semantic_axes.get(2) {
+        score_for_axis(&llm.axis_scores, axis)?
+    } else {
+        0.0
+    };
+
+    Some(Vec3::new(x, y, z) * 1.35)
+}
+
+fn score_for_axis(scores: &[crate::models::AxisScore], axis: &SemanticAxis) -> Option<f32> {
+    scores
+        .iter()
+        .find(|score| {
+            score.negative_label == axis.negative_label
+                && score.positive_label == axis.positive_label
+        })
+        .map(|score| score.score.clamp(-1.0, 1.0))
+}
+
+fn axis_projection_coverage(snapshot: &DashboardSnapshot, semantic_axes: &[SemanticAxis]) -> usize {
+    snapshot
+        .pages
+        .iter()
+        .filter(|page| axis_target_position(page, semantic_axes).is_some())
+        .count()
+}
+
+fn axis_overlay_label(semantic_axes: &[SemanticAxis]) -> String {
+    let labels = semantic_axes
+        .iter()
+        .take(3)
+        .map(|axis| format!("{}<>{}", axis.negative_label, axis.positive_label))
+        .collect::<Vec<_>>();
+    if labels.is_empty() {
+        "no axes configured".to_string()
+    } else {
+        labels.join("  //  ")
+    }
+}
+
 fn apply_semantic_forces(
     semantic_state: &SemanticState,
     url_to_index: &HashMap<&str, usize>,
@@ -578,7 +705,7 @@ fn apply_semantic_forces(
     mode: GraphColorMode,
 ) {
     let (pair_gain, pair_target, cluster_gain) = match mode {
-        GraphColorMode::Novelty => return,
+        GraphColorMode::Novelty | GraphColorMode::AxisProjection => return,
         GraphColorMode::PageSemantic => (0.48, 0.24, 0.065),
         GraphColorMode::JudgmentSemantic => (0.54, 0.22, 0.072),
     };
@@ -641,7 +768,7 @@ fn semantic_signature(snapshot: &DashboardSnapshot, mode: GraphColorMode) -> u64
         page.url.hash(&mut hasher);
         page.content_hash.hash(&mut hasher);
         match mode {
-            GraphColorMode::Novelty => {}
+            GraphColorMode::Novelty | GraphColorMode::AxisProjection => {}
             GraphColorMode::PageSemantic => {
                 hash_option_embedding(page.embedding.as_deref(), &mut hasher);
             }
@@ -757,6 +884,7 @@ fn build_resonance_pairs(
         GraphColorMode::Novelty => 1.1,
         GraphColorMode::PageSemantic => 0.78,
         GraphColorMode::JudgmentSemantic => 0.82,
+        GraphColorMode::AxisProjection => 1.1,
     };
 
     let mut pairs = Vec::new();
@@ -820,6 +948,7 @@ fn draw_scope_rings(painter: &egui::Painter, rect: Rect, mode: GraphColorMode) {
         GraphColorMode::Novelty => Color32::from_rgba_unmultiplied(255, 96, 96, 18),
         GraphColorMode::PageSemantic => Color32::from_rgba_unmultiplied(92, 225, 255, 22),
         GraphColorMode::JudgmentSemantic => Color32::from_rgba_unmultiplied(255, 176, 72, 24),
+        GraphColorMode::AxisProjection => Color32::from_rgba_unmultiplied(188, 142, 255, 24),
     };
 
     for factor in [0.22, 0.36, 0.52, 0.72, 1.0] {
@@ -837,6 +966,7 @@ fn draw_semantic_resonance(
         GraphColorMode::Novelty => Color32::from_rgba_unmultiplied(0, 0, 0, 0),
         GraphColorMode::PageSemantic => Color32::from_rgb(92, 225, 255),
         GraphColorMode::JudgmentSemantic => Color32::from_rgb(255, 176, 72),
+        GraphColorMode::AxisProjection => Color32::from_rgba_unmultiplied(0, 0, 0, 0),
     };
 
     for pair in &semantic_state.resonance_pairs {
@@ -863,6 +993,7 @@ fn node_color(mode: GraphColorMode, energy: f32, fade: f32, cluster: Option<usiz
         GraphColorMode::Novelty => energy_color(energy, fade),
         GraphColorMode::PageSemantic => cluster_color(cluster, fade, PAGE_CLUSTER_COLORS),
         GraphColorMode::JudgmentSemantic => cluster_color(cluster, fade, JUDGMENT_CLUSTER_COLORS),
+        GraphColorMode::AxisProjection => axis_color(cluster, fade),
     }
 }
 
@@ -871,8 +1002,20 @@ fn node_stroke(mode: GraphColorMode, fade: f32, cluster: Option<usize>) -> Strok
         GraphColorMode::Novelty => Color32::from_rgba_unmultiplied(255, 92, 92, 90),
         GraphColorMode::PageSemantic => cluster_outline(cluster, fade, PAGE_CLUSTER_COLORS),
         GraphColorMode::JudgmentSemantic => cluster_outline(cluster, fade, JUDGMENT_CLUSTER_COLORS),
+        GraphColorMode::AxisProjection => {
+            Color32::from_rgba_unmultiplied(188, 142, 255, (130.0 * fade + 40.0) as u8)
+        }
     };
     Stroke::new(1.0, color)
+}
+
+fn axis_color(cluster: Option<usize>, fade: f32) -> Color32 {
+    let base = match cluster.unwrap_or(0) % 3 {
+        0 => Color32::from_rgb(183, 118, 255),
+        1 => Color32::from_rgb(112, 214, 255),
+        _ => Color32::from_rgb(255, 170, 96),
+    };
+    Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), (178.0 * fade + 42.0) as u8)
 }
 
 fn energy_color(energy: f32, fade: f32) -> Color32 {
@@ -926,6 +1069,7 @@ fn draw_tooltip(
     hovered: HoveredNode<'_>,
     mode: GraphColorMode,
     semantic_state: &SemanticState,
+    semantic_axes: &[SemanticAxis],
 ) {
     egui::Area::new(egui::Id::new(("graph-tooltip", &hovered.page.url)))
         .order(egui::Order::Tooltip)
@@ -952,7 +1096,10 @@ fn draw_tooltip(
                         .size(11.0)
                         .color(Color32::from_rgb(116, 205, 255)),
                     );
-                    if mode != GraphColorMode::Novelty {
+                    if matches!(
+                        mode,
+                        GraphColorMode::PageSemantic | GraphColorMode::JudgmentSemantic
+                    ) {
                         let semantic_line = semantic_state
                             .clusters
                             .get(&hovered.page.url)
@@ -964,6 +1111,25 @@ fn draw_tooltip(
                                 .size(11.0)
                                 .color(Color32::from_rgb(255, 188, 102)),
                         );
+                    } else if mode == GraphColorMode::AxisProjection {
+                        let axis_lines = axis_score_lines(hovered.page, semantic_axes);
+                        if axis_lines.is_empty() {
+                            ui.label(
+                                egui::RichText::new("no axis scores")
+                                    .monospace()
+                                    .size(11.0)
+                                    .color(Color32::from_rgb(255, 188, 102)),
+                            );
+                        } else {
+                            for line in axis_lines {
+                                ui.label(
+                                    egui::RichText::new(line)
+                                        .monospace()
+                                        .size(11.0)
+                                        .color(Color32::from_rgb(188, 142, 255)),
+                                );
+                            }
+                        }
                     }
                     ui.hyperlink_to(
                         egui::RichText::new(&hovered.page.url)
@@ -1016,6 +1182,29 @@ fn draw_tooltip(
                     );
                 });
         });
+}
+
+fn axis_score_lines(page: &PageRecord, semantic_axes: &[SemanticAxis]) -> Vec<String> {
+    let Some(llm) = &page.llm_novelty else {
+        return Vec::new();
+    };
+    semantic_axes
+        .iter()
+        .filter_map(|axis| {
+            llm.axis_scores
+                .iter()
+                .find(|score| {
+                    score.negative_label == axis.negative_label
+                        && score.positive_label == axis.positive_label
+                })
+                .map(|score| {
+                    format!(
+                        "{} / {}  {:+.2}",
+                        score.negative_label, score.positive_label, score.score
+                    )
+                })
+        })
+        .collect()
 }
 
 fn seeded_position(url: &str) -> Vec3 {

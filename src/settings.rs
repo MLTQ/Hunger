@@ -110,6 +110,7 @@ struct PartialEditableSettings {
     embedding_model: Option<String>,
     page_semantic_map_enabled: Option<bool>,
     llm_semantic_map_enabled: Option<bool>,
+    semantic_axes: Option<Vec<crate::models::SemanticAxis>>,
     request_timeout_secs: Option<u64>,
     llm_timeout_secs: Option<u64>,
     crawl_idle_ms: Option<u64>,
@@ -146,6 +147,9 @@ impl PartialEditableSettings {
         }
         if let Some(value) = self.llm_semantic_map_enabled {
             base.llm_semantic_map_enabled = value;
+        }
+        if let Some(value) = self.semantic_axes {
+            base.semantic_axes = value;
         }
         if let Some(value) = self.request_timeout_secs {
             base.request_timeout_secs = value;
@@ -190,6 +194,11 @@ mod tests {
             embedding_model: None,
             page_semantic_map_enabled: true,
             llm_semantic_map_enabled: false,
+            semantic_axes: vec![
+                crate::models::SemanticAxis::default(),
+                crate::models::SemanticAxis::default(),
+                crate::models::SemanticAxis::default(),
+            ],
             request_timeout_secs: 20,
             llm_timeout_secs: 75,
             crawl_idle_ms: 1500,

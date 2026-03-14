@@ -10,9 +10,14 @@ Wraps an OpenAI-compatible HTTP surface for novelty judgments and optional embed
 - **Interacts with**: `Config` in `config.rs`, `Crawler` in `crawler.rs`
 
 ### `OpenAiCompatibleClient::score_novelty`
-- **Does**: Builds a compact novelty prompt, prefers structured-output hints when the server accepts them, calls the chat model, and parses the structured judgment.
+- **Does**: Builds a compact novelty prompt, injects any configured semantic axes, requests a `json_schema` response when the server accepts it, calls the chat model, and parses the structured judgment.
 - **Interacts with**: `PageDigest` and `PageRecord` in `models.rs`
 - **Rationale**: Keeps model-specific prompting isolated so the core automaton logic can stay model-agnostic while remaining fast enough for local inference.
+
+### `OpenAiCompatibleClient::score_axes_for_page`
+- **Does**: Re-scores already-crawled pages onto the configured semantic axes using stored page summaries plus the prior novelty judgment, then normalizes the returned axis list to the operator-defined order.
+- **Interacts with**: `BackfillController` in `backfill.rs`, `SemanticAxis` and `AxisScore` in `models.rs`
+- **Rationale**: Lets the AXES projection be populated retroactively without forcing a full page re-crawl or a second extraction pass.
 
 ### `OpenAiCompatibleClient::repair_novelty_response`
 - **Does**: Performs a second, shorter repair pass when a local model emits prose, markdown, or truncated reasoning instead of directly returning valid JSON.
@@ -38,4 +43,7 @@ Wraps an OpenAI-compatible HTTP surface for novelty judgments and optional embed
 ## Notes
 - The parser accepts pure JSON, JSON embedded in surrounding prose, or fenced JSON blocks before falling back to a repair request.
 - Reasoning is now expected to live inside the structured payload so it can be stored and rendered without breaking the crawler loop.
-- If the server rejects `response_format`, the client retries the same request as plain text and relies on parsing/repair instead of failing the crawl step outright.
+- LM Studio-style servers that insist on `json_schema` now get that richer hint first, which cuts down on avoidable 400s and reduces repair traffic.
+- If the server still rejects `response_format`, the client retries the same request as plain text and relies on parsing/repair instead of failing the crawl step outright.
+- Custom semantic axes are scored as part of the same LLM judgment so a page can be projected into an operator-defined coordinate system without a second model call.
+- The same client also provides a smaller axis-only repairable prompt for the operator-triggered backfill pass, so legacy rows can gain `axis_scores` after axes are introduced or renamed.

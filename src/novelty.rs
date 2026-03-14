@@ -158,6 +158,7 @@ fn fallback_novelty(cheap: &CheapSignals, config: &Config) -> LlmNovelty {
         likely_redundant_aspects: Vec::new(),
         recommended_action: recommended_action.to_string(),
         recommended_link_hints: Vec::new(),
+        axis_scores: Vec::new(),
     }
 }
 

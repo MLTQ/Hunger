@@ -1,11 +1,11 @@
 use anyhow::{Context, Result, anyhow};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::{
     config::Config,
-    models::{CheapSignals, LinkHint, LlmNovelty, PageDigest, PageRecord},
+    models::{AxisScore, CheapSignals, LinkHint, LlmNovelty, PageDigest, PageRecord, SemanticAxis},
 };
 
 #[derive(Clone)]
@@ -15,6 +15,7 @@ pub struct OpenAiCompatibleClient {
     api_key: String,
     chat_model: String,
     embedding_model: Option<String>,
+    semantic_axes: Vec<SemanticAxis>,
 }
 
 impl OpenAiCompatibleClient {
@@ -37,6 +38,7 @@ impl OpenAiCompatibleClient {
             api_key: config.llm_api_key.clone(),
             chat_model: config.llm_model.clone(),
             embedding_model: config.embedding_model.clone(),
+            semantic_axes: config.semantic_axes.clone(),
         })
     }
 
@@ -74,12 +76,18 @@ impl OpenAiCompatibleClient {
         same_domain_pages: &[PageRecord],
         cheap_signals: &CheapSignals,
     ) -> Result<LlmNovelty> {
-        let prompt = build_prompt(candidate, similar_pages, same_domain_pages, cheap_signals);
+        let prompt = build_prompt(
+            candidate,
+            similar_pages,
+            same_domain_pages,
+            cheap_signals,
+            &self.semantic_axes,
+        );
         let request = ChatCompletionRequest {
             model: self.chat_model.clone(),
             temperature: Some(0.1),
             max_tokens: Some(420),
-            response_format: Some(ResponseFormat::json_object()),
+            response_format: Some(novelty_response_format()),
             messages: vec![
                 Message {
                     role: "system".to_string(),
@@ -114,6 +122,55 @@ impl OpenAiCompatibleClient {
         }
     }
 
+    pub async fn score_axes_for_page(
+        &self,
+        url: &str,
+        title: &str,
+        summary: &str,
+        novelty: &LlmNovelty,
+    ) -> Result<Vec<AxisScore>> {
+        if self.semantic_axes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let prompt = build_axis_prompt(url, title, summary, novelty, &self.semantic_axes);
+        let request = ChatCompletionRequest {
+            model: self.chat_model.clone(),
+            temperature: Some(0.0),
+            max_tokens: Some(240),
+            response_format: Some(axis_response_format()),
+            messages: vec![
+                Message {
+                    role: "system".to_string(),
+                    content: AXIS_SYSTEM_PROMPT.to_string(),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: prompt,
+                },
+            ],
+        };
+        let content = self
+            .send_chat_completion(request, "axis scoring endpoint")
+            .await?;
+
+        match parse_axis_scores_json(&content) {
+            Ok(scores) => Ok(normalize_axis_scores(scores, &self.semantic_axes)),
+            Err(parse_error) => {
+                tracing::debug!(
+                    error = %parse_error,
+                    raw_response = %compact_text(&content, 280),
+                    "axis response was not directly parseable; attempting JSON repair"
+                );
+                self.repair_axis_response(&content).await.with_context(|| {
+                    format!(
+                        "axis response was not usable as JSON; primary parse error: {parse_error}"
+                    )
+                })
+            }
+        }
+    }
+
     pub fn auth_mode(&self) -> &'static str {
         if self.api_key.is_empty() {
             "none"
@@ -135,11 +192,22 @@ Preserve the source reasoning in the `analysis` field.
 If a score is missing, infer conservatively from the provided text.
 Return a single valid JSON object and no other text."#;
 
+const AXIS_SYSTEM_PROMPT: &str = r#"You map a crawled page onto operator-defined semantic axes.
+Return exactly one JSON object with an `axis_scores` array and no other text.
+Each axis score must stay in [-1.0, 1.0], where -1.0 means the page strongly matches the negative label and 1.0 means it strongly matches the positive label.
+Use the provided page summary and prior novelty judgment as evidence.
+If evidence is weak, stay close to 0.0 and explain the uncertainty briefly."#;
+
+const AXIS_REPAIR_SYSTEM_PROMPT: &str = r#"You repair crawler axis judgments into valid JSON.
+Return exactly one JSON object with an `axis_scores` array and no surrounding text.
+Preserve any useful reasoning inside each axis score's `explanation` field."#;
+
 fn build_prompt(
     candidate: &PageDigest,
     similar_pages: &[PageRecord],
     same_domain_pages: &[PageRecord],
     cheap_signals: &CheapSignals,
+    semantic_axes: &[SemanticAxis],
 ) -> String {
     let nearby = similar_pages
         .iter()
@@ -162,6 +230,32 @@ fn build_prompt(
         .map(|link| format!("- {} | {}", link.url, link.anchor))
         .collect::<Vec<_>>()
         .join("\n");
+    let axes = semantic_axes
+        .iter()
+        .enumerate()
+        .map(|(index, axis)| {
+            format!(
+                "- axis_{index}: {} <-> {}",
+                compact_text(&axis.negative_label, 40),
+                compact_text(&axis.positive_label, 40)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let axis_instruction = if semantic_axes.is_empty() {
+        "- axis_scores: []".to_string()
+    } else {
+        format!(
+            r#"- axis_scores: [{{
+    "negative_label": "{}",
+    "positive_label": "{}",
+    "score": -1.0 to 1.0,
+    "explanation": "short rationale"
+  }}] // one entry per configured axis in the same order"#,
+            compact_text(&semantic_axes[0].negative_label, 40),
+            compact_text(&semantic_axes[0].positive_label, 40)
+        )
+    };
 
     format!(
         r#"Candidate page:
@@ -191,6 +285,9 @@ Cheap signals:
 - content_delta_from_last_snapshot: {content_delta:.3}
 - boilerplate_penalty: {boilerplate_penalty:.3}
 
+Configured semantic axes:
+{axes}
+
 Return JSON:
 {{
   "factual_novelty": 0.0-1.0,
@@ -203,7 +300,8 @@ Return JSON:
   "likely_novel_aspects": ["..."],
   "likely_redundant_aspects": ["..."],
   "recommended_action": "expand|sample|ignore",
-  "recommended_link_hints": [{{"link_url": "...", "reason": "...", "priority": 0.0-1.0}}]
+  "recommended_link_hints": [{{"link_url": "...", "reason": "...", "priority": 0.0-1.0}}],
+  {axis_instruction}
 }}"#,
         url = candidate.url,
         title = compact_text(&candidate.title, 120),
@@ -241,6 +339,98 @@ Return JSON:
         local_graph_diversity = cheap_signals.local_graph_diversity,
         content_delta = cheap_signals.content_delta_from_last_snapshot,
         boilerplate_penalty = cheap_signals.boilerplate_penalty,
+        axes = if semantic_axes.is_empty() {
+            "- none configured".to_string()
+        } else {
+            axes
+        },
+        axis_instruction = axis_instruction,
+    )
+}
+
+fn build_axis_prompt(
+    url: &str,
+    title: &str,
+    summary: &str,
+    novelty: &LlmNovelty,
+    semantic_axes: &[SemanticAxis],
+) -> String {
+    let axes = semantic_axes
+        .iter()
+        .enumerate()
+        .map(|(index, axis)| {
+            format!(
+                "- axis_{index}: {} <-> {}",
+                compact_text(&axis.negative_label, 48),
+                compact_text(&axis.positive_label, 48)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let novel_aspects = if novelty.likely_novel_aspects.is_empty() {
+        "- none".to_string()
+    } else {
+        novelty
+            .likely_novel_aspects
+            .iter()
+            .take(4)
+            .map(|item| format!("- {}", compact_text(item, 120)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let redundant_aspects = if novelty.likely_redundant_aspects.is_empty() {
+        "- none".to_string()
+    } else {
+        novelty
+            .likely_redundant_aspects
+            .iter()
+            .take(4)
+            .map(|item| format!("- {}", compact_text(item, 120)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    format!(
+        r#"Page:
+url: {url}
+title: {title}
+summary: {summary}
+
+Stored novelty judgment:
+- concise_reason: {concise_reason}
+- analysis: {analysis}
+- likely_novel_aspects:
+{novel_aspects}
+- likely_redundant_aspects:
+{redundant_aspects}
+
+Configured semantic axes:
+{axes}
+
+Return JSON:
+{{
+  "axis_scores": [
+    {{
+      "negative_label": "{negative}",
+      "positive_label": "{positive}",
+      "score": -1.0 to 1.0,
+      "explanation": "short rationale grounded in the page"
+    }}
+  ]
+}}
+
+Return one entry per configured axis and preserve the same order."#,
+        url = url,
+        title = compact_text(title, 120),
+        summary = compact_text(summary, 500),
+        concise_reason = compact_text(&novelty.concise_reason, 180),
+        analysis = compact_text(&novelty.analysis, 420),
+        novel_aspects = novel_aspects,
+        redundant_aspects = redundant_aspects,
+        axes = axes,
+        negative = compact_text(&semantic_axes[0].negative_label, 48),
+        positive = compact_text(&semantic_axes[0].positive_label, 48),
     )
 }
 
@@ -250,7 +440,7 @@ impl OpenAiCompatibleClient {
             model: self.chat_model.clone(),
             temperature: Some(0.0),
             max_tokens: Some(320),
-            response_format: Some(ResponseFormat::json_object()),
+            response_format: Some(novelty_response_format()),
             messages: vec![
                 Message {
                     role: "system".to_string(),
@@ -271,7 +461,8 @@ impl OpenAiCompatibleClient {
   "likely_novel_aspects": ["..."],
   "likely_redundant_aspects": ["..."],
   "recommended_action": "expand|sample|ignore",
-  "recommended_link_hints": [{{"link_url": "...", "reason": "...", "priority": 0.0-1.0}}]
+  "recommended_link_hints": [{{"link_url": "...", "reason": "...", "priority": 0.0-1.0}}],
+  "axis_scores": [{{"negative_label": "...", "positive_label": "...", "score": -1.0, "explanation": "..."}}]
 }}
 
 Raw model output:
@@ -285,6 +476,45 @@ Raw model output:
             .await?;
 
         parse_llm_json(&content)
+    }
+
+    async fn repair_axis_response(&self, raw_content: &str) -> Result<Vec<AxisScore>> {
+        let request = ChatCompletionRequest {
+            model: self.chat_model.clone(),
+            temperature: Some(0.0),
+            max_tokens: Some(220),
+            response_format: Some(axis_response_format()),
+            messages: vec![
+                Message {
+                    role: "system".to_string(),
+                    content: AXIS_REPAIR_SYSTEM_PROMPT.to_string(),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: format!(
+                        r#"Convert the following crawler axis judgment into valid JSON with this shape:
+{{
+  "axis_scores": [
+    {{
+      "negative_label": "...",
+      "positive_label": "...",
+      "score": -1.0 to 1.0,
+      "explanation": "..."
+    }}
+  ]
+}}
+
+Raw model output:
+{raw_content}"#
+                    ),
+                },
+            ],
+        };
+        let content = self
+            .send_chat_completion(request, "axis repair endpoint")
+            .await?;
+        let scores = parse_axis_scores_json(&content)?;
+        Ok(normalize_axis_scores(scores, &self.semantic_axes))
     }
 
     async fn send_chat_completion(
@@ -345,6 +575,14 @@ fn parse_llm_json(content: &str) -> Result<LlmNovelty> {
 
     clamp_novelty(&mut novelty);
     Ok(novelty)
+}
+
+fn parse_axis_scores_json(content: &str) -> Result<Vec<AxisScore>> {
+    let json =
+        extract_json_object(content).ok_or_else(|| anyhow!("model response was not JSON"))?;
+    let payload: AxisScoreResponse =
+        serde_json::from_str(&json).context("failed to parse axis JSON")?;
+    Ok(payload.axis_scores)
 }
 
 fn extract_json_object(content: &str) -> Option<String> {
@@ -460,6 +698,122 @@ fn clamp_novelty(novelty: &mut LlmNovelty) {
     for LinkHint { priority, .. } in &mut novelty.recommended_link_hints {
         *priority = priority.clamp(0.0, 1.0);
     }
+    for AxisScore { score, .. } in &mut novelty.axis_scores {
+        *score = score.clamp(-1.0, 1.0);
+    }
+}
+
+fn normalize_axis_scores(scores: Vec<AxisScore>, semantic_axes: &[SemanticAxis]) -> Vec<AxisScore> {
+    semantic_axes
+        .iter()
+        .map(|axis| {
+            let matched = scores.iter().find(|score| {
+                score.negative_label.trim() == axis.negative_label.trim()
+                    && score.positive_label.trim() == axis.positive_label.trim()
+            });
+
+            let mut score = matched.cloned().unwrap_or_else(|| AxisScore {
+                negative_label: axis.negative_label.clone(),
+                positive_label: axis.positive_label.clone(),
+                score: 0.0,
+                explanation: "Axis backfill could not confidently place this page.".to_string(),
+            });
+            score.negative_label = axis.negative_label.clone();
+            score.positive_label = axis.positive_label.clone();
+            score.score = score.score.clamp(-1.0, 1.0);
+            score
+        })
+        .collect()
+}
+
+fn novelty_response_format() -> ResponseFormat {
+    ResponseFormat::json_schema(
+        "novelty_judgment",
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+                "factual_novelty",
+                "entity_novelty",
+                "relational_novelty",
+                "temporal_novelty",
+                "expected_crawl_value",
+                "analysis",
+                "concise_reason",
+                "likely_novel_aspects",
+                "likely_redundant_aspects",
+                "recommended_action",
+                "recommended_link_hints",
+                "axis_scores"
+            ],
+            "properties": {
+                "factual_novelty": { "type": "number" },
+                "entity_novelty": { "type": "number" },
+                "relational_novelty": { "type": "number" },
+                "temporal_novelty": { "type": "number" },
+                "expected_crawl_value": { "type": "number" },
+                "analysis": { "type": "string" },
+                "concise_reason": { "type": "string" },
+                "likely_novel_aspects": { "type": "array", "items": { "type": "string" } },
+                "likely_redundant_aspects": { "type": "array", "items": { "type": "string" } },
+                "recommended_action": { "type": "string" },
+                "recommended_link_hints": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["link_url", "reason", "priority"],
+                        "properties": {
+                            "link_url": { "type": "string" },
+                            "reason": { "type": "string" },
+                            "priority": { "type": "number" }
+                        }
+                    }
+                },
+                "axis_scores": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["negative_label", "positive_label", "score", "explanation"],
+                        "properties": {
+                            "negative_label": { "type": "string" },
+                            "positive_label": { "type": "string" },
+                            "score": { "type": "number" },
+                            "explanation": { "type": "string" }
+                        }
+                    }
+                }
+            }
+        }),
+    )
+}
+
+fn axis_response_format() -> ResponseFormat {
+    ResponseFormat::json_schema(
+        "axis_scores",
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["axis_scores"],
+            "properties": {
+                "axis_scores": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["negative_label", "positive_label", "score", "explanation"],
+                        "properties": {
+                            "negative_label": { "type": "string" },
+                            "positive_label": { "type": "string" },
+                            "score": { "type": "number" },
+                            "explanation": { "type": "string" }
+                        }
+                    }
+                }
+            }
+        }),
+    )
 }
 
 #[derive(Debug, Serialize)]
@@ -504,23 +858,48 @@ struct ChatChoice {
     message: Message,
 }
 
+#[derive(Debug, Deserialize)]
+struct AxisScoreResponse {
+    #[serde(default)]
+    axis_scores: Vec<AxisScore>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct ResponseFormat {
     #[serde(rename = "type")]
     response_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    json_schema: Option<JsonSchemaDefinition>,
 }
 
 impl ResponseFormat {
-    fn json_object() -> Self {
+    fn json_schema(name: &str, schema: Value) -> Self {
         Self {
-            response_type: "json_object".to_string(),
+            response_type: "json_schema".to_string(),
+            json_schema: Some(JsonSchemaDefinition {
+                name: name.to_string(),
+                strict: true,
+                schema,
+            }),
         }
     }
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct JsonSchemaDefinition {
+    name: String,
+    strict: bool,
+    schema: Value,
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ResponseFormat, parse_llm_json, should_retry_without_response_format};
+    use super::{
+        ResponseFormat, normalize_axis_scores, parse_axis_scores_json, parse_llm_json,
+        should_retry_without_response_format,
+    };
+    use crate::models::{AxisScore, SemanticAxis};
+    use serde_json::json;
 
     #[test]
     fn parses_embedded_json_after_reasoning_preamble() {
@@ -573,7 +952,10 @@ mod tests {
         assert!(should_retry_without_response_format(
             400,
             r#"{"error":"'response_format.type' must be 'json_schema' or 'text'"}"#,
-            Some(&ResponseFormat::json_object())
+            Some(&ResponseFormat::json_schema(
+                "test",
+                json!({"type": "object", "properties": {}})
+            ))
         ));
     }
 
@@ -582,7 +964,58 @@ mod tests {
         assert!(!should_retry_without_response_format(
             400,
             r#"{"error":"unknown model"}"#,
-            Some(&ResponseFormat::json_object())
+            Some(&ResponseFormat::json_schema(
+                "test",
+                json!({"type": "object", "properties": {}})
+            ))
         ));
+    }
+
+    #[test]
+    fn parses_axis_scores_from_embedded_json() {
+        let content = r#"Axis placement:
+{
+  "axis_scores": [
+    {
+      "negative_label": "Isolationist",
+      "positive_label": "Expansionist",
+      "score": 0.65,
+      "explanation": "The page argues for broader foreign intervention."
+    }
+  ]
+}"#;
+
+        let scores = parse_axis_scores_json(content).expect("should parse axis JSON");
+        assert_eq!(scores.len(), 1);
+        assert_eq!(scores[0].positive_label, "Expansionist");
+    }
+
+    #[test]
+    fn normalize_axis_scores_preserves_configured_order() {
+        let configured = vec![
+            SemanticAxis {
+                negative_label: "Left".to_string(),
+                positive_label: "Right".to_string(),
+            },
+            SemanticAxis {
+                negative_label: "Local".to_string(),
+                positive_label: "Global".to_string(),
+            },
+        ];
+        let normalized = normalize_axis_scores(
+            vec![AxisScore {
+                negative_label: "Local".to_string(),
+                positive_label: "Global".to_string(),
+                score: 0.8,
+                explanation: "test".to_string(),
+            }],
+            &configured,
+        );
+
+        assert_eq!(normalized.len(), 2);
+        assert_eq!(normalized[0].negative_label, "Left");
+        assert_eq!(normalized[1].positive_label, "Global");
+        assert_eq!(normalized[1].score, 0.8);
+        assert_eq!(normalized[0].score, 0.0);
     }
 }

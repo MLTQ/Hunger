@@ -28,3 +28,4 @@ Runs the long-lived crawl loop that pulls work from the frontier, fetches pages,
 ## Notes
 - Robots-aware fetching is still a TODO; the first cut enforces HTML-only crawling and bounded expansion.
 - Page-content and LLM-judgment embeddings are independently switchable so operators can trade semantic richness against local-model latency.
+- The crawler and backfill controller share the same pause flag, so operator-triggered backfill can temporarily take the crawl loop offline instead of competing for LLM and SQLite bandwidth.

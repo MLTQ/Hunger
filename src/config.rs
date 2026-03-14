@@ -8,6 +8,8 @@ use std::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::models::SemanticAxis;
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub bind_addr: SocketAddr,
@@ -20,6 +22,7 @@ pub struct Config {
     pub embedding_model: Option<String>,
     pub page_semantic_map_enabled: bool,
     pub llm_semantic_map_enabled: bool,
+    pub semantic_axes: Vec<SemanticAxis>,
     pub request_timeout: Duration,
     pub llm_timeout: Duration,
     pub crawl_idle_delay: Duration,
@@ -63,6 +66,7 @@ impl Config {
             .filter(|value| !value.is_empty());
         let page_semantic_map_enabled = read_bool("HUNGER_PAGE_SEMANTIC_MAP", true);
         let llm_semantic_map_enabled = read_bool("HUNGER_LLM_SEMANTIC_MAP", false);
+        let semantic_axes = read_semantic_axes_from_env();
 
         let request_timeout = Duration::from_secs(read_u64("HUNGER_REQUEST_TIMEOUT_SECS", 20));
         let llm_timeout = Duration::from_secs(read_u64("HUNGER_LLM_TIMEOUT_SECS", 75));
@@ -82,6 +86,7 @@ impl Config {
             embedding_model,
             page_semantic_map_enabled,
             llm_semantic_map_enabled,
+            semantic_axes,
             request_timeout,
             llm_timeout,
             crawl_idle_delay,
@@ -102,6 +107,7 @@ impl Config {
             embedding_model: self.embedding_model.clone(),
             page_semantic_map_enabled: self.page_semantic_map_enabled,
             llm_semantic_map_enabled: self.llm_semantic_map_enabled,
+            semantic_axes: expand_axis_settings(&self.semantic_axes),
             request_timeout_secs: self.request_timeout.as_secs(),
             llm_timeout_secs: self.llm_timeout.as_secs(),
             crawl_idle_ms: self.crawl_idle_delay.as_millis() as u64,
@@ -139,6 +145,7 @@ impl Config {
                 .filter(|value| !value.is_empty()),
             page_semantic_map_enabled: editable.page_semantic_map_enabled,
             llm_semantic_map_enabled: editable.llm_semantic_map_enabled,
+            semantic_axes: normalize_semantic_axes(&editable.semantic_axes),
             request_timeout: Duration::from_secs(editable.request_timeout_secs.max(1)),
             llm_timeout: Duration::from_secs(editable.llm_timeout_secs.max(1)),
             crawl_idle_delay: Duration::from_millis(editable.crawl_idle_ms.max(100)),
@@ -160,6 +167,7 @@ pub struct EditableSettings {
     pub embedding_model: Option<String>,
     pub page_semantic_map_enabled: bool,
     pub llm_semantic_map_enabled: bool,
+    pub semantic_axes: Vec<SemanticAxis>,
     pub request_timeout_secs: u64,
     pub llm_timeout_secs: u64,
     pub crawl_idle_ms: u64,
@@ -208,6 +216,44 @@ fn normalize_llm_base_url(value: &str) -> String {
     } else {
         format!("http://{trimmed}")
     }
+}
+
+fn read_semantic_axes_from_env() -> Vec<SemanticAxis> {
+    let raw = env::var("HUNGER_SEMANTIC_AXES").unwrap_or_default();
+    if raw.trim().is_empty() {
+        return Vec::new();
+    }
+
+    raw.split(';')
+        .filter_map(|pair| {
+            let (negative, positive) = pair.split_once(':')?;
+            let axis = SemanticAxis {
+                negative_label: negative.trim().to_string(),
+                positive_label: positive.trim().to_string(),
+            };
+            axis.is_configured().then_some(axis)
+        })
+        .take(3)
+        .collect()
+}
+
+fn normalize_semantic_axes(axes: &[SemanticAxis]) -> Vec<SemanticAxis> {
+    axes.iter()
+        .map(|axis| SemanticAxis {
+            negative_label: axis.negative_label.trim().to_string(),
+            positive_label: axis.positive_label.trim().to_string(),
+        })
+        .filter(SemanticAxis::is_configured)
+        .take(3)
+        .collect()
+}
+
+fn expand_axis_settings(axes: &[SemanticAxis]) -> Vec<SemanticAxis> {
+    let mut expanded = axes.iter().take(3).cloned().collect::<Vec<_>>();
+    while expanded.len() < 3 {
+        expanded.push(SemanticAxis::default());
+    }
+    expanded
 }
 
 fn executable_dir() -> Result<PathBuf> {

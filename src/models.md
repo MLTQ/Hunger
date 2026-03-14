@@ -9,6 +9,10 @@ Holds the shared data structures that move between the extractor, novelty scorer
 - **Does**: Represents the cleaned content, extracted claims/entities, and outbound links for a fetched page.
 - **Interacts with**: `extract_page` in `extractor.rs`, `Crawler` in `crawler.rs`
 
+### `SemanticAxis`, `AxisScore`
+- **Does**: Define operator-configured bipolar semantic axes and the LLM’s per-page placements on those axes.
+- **Interacts with**: `Config` in `config.rs`, `OpenAiCompatibleClient` in `llm.rs`, `GraphViewport` in `graph_view.rs`
+
 ### `CheapSignals`, `LlmNovelty`, `NoveltyScore`
 - **Does**: Separate heuristic scoring, model judgment, and final energy calculation into explicit stages.
 - **Interacts with**: `compute_cheap_signals` and `combine_scores` in `novelty.rs`, `OpenAiCompatibleClient::score_novelty` in `llm.rs`
@@ -18,8 +22,8 @@ Holds the shared data structures that move between the extractor, novelty scorer
 - **Does**: Shape persisted crawl state and the data served to the dashboard, including the stored parsed LLM novelty response and optional page / LLM semantic embeddings for inspected pages.
 - **Interacts with**: `Database` in `db.rs`, handlers in `ui.rs`
 
-### `PageEmbeddingBackfillRecord`, `LlmEmbeddingBackfillRecord`
-- **Does**: Provide the minimal payloads the background backfill pass needs to regenerate semantic embeddings for already-stored pages.
+### `PageEmbeddingBackfillRecord`, `LlmEmbeddingBackfillRecord`, `AxisBackfillRecord`
+- **Does**: Provide the minimal payloads the background backfill pass needs to regenerate page embeddings, LLM-response embeddings, and operator-axis placements for already-stored pages.
 - **Interacts with**: `Database` in `db.rs`, `BackfillController` in `backfill.rs`
 
 ## Contracts

@@ -19,9 +19,9 @@ Owns SQLite schema creation and the queries that persist frontier state, crawled
 - **Rationale**: Centralizes row decoding so SQLite-specific timestamp quirks are handled once instead of leaking into the UI.
 
 ### Backfill Queries / Updates
-- **Does**: Counts missing semantic embeddings, pulls batches of rows that need backfill, and writes the regenerated vectors back onto existing pages.
+- **Does**: Counts missing semantic embeddings, exposes paged reads of stored novelty judgments for axis rescoring, and writes regenerated vectors or updated `llm_novelty_json` back onto existing pages.
 - **Interacts with**: `BackfillController` in `backfill.rs`
-- **Rationale**: Lets semantic visualization modes be retrofitted onto a preexisting crawl without re-fetching the web.
+- **Rationale**: Lets semantic visualization modes and operator-defined axis projections be retrofitted onto a preexisting crawl without re-fetching the web.
 
 ## Contracts
 

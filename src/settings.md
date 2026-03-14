@@ -15,7 +15,7 @@ Persists dashboard-editable settings to a local JSON file and exposes the active
 - **Rationale**: Keeps persistence and validation in one place so the UI does not drift from runtime behavior.
 
 ### `PartialEditableSettings`
-- **Does**: Accepts older settings files with missing fields and merges them onto the current defaults during startup, including newer semantic-analysis toggles.
+- **Does**: Accepts older settings files with missing fields and merges them onto the current defaults during startup, including newer semantic-analysis toggles and operator-defined semantic axes.
 - **Interacts with**: `SettingsManager::new`
 
 ### `SettingsSnapshot`

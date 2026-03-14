@@ -3,8 +3,9 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
 
 use crate::models::{
-    DashboardSnapshot, FrontierEntry, GraphEdge, GraphNode, LlmEmbeddingBackfillRecord, LlmNovelty,
-    NoveltyScore, OutboundLink, PageDigest, PageEmbeddingBackfillRecord, PageRecord,
+    AxisBackfillRecord, DashboardSnapshot, FrontierEntry, GraphEdge, GraphNode,
+    LlmEmbeddingBackfillRecord, LlmNovelty, NoveltyScore, OutboundLink, PageDigest,
+    PageEmbeddingBackfillRecord, PageRecord,
 };
 
 #[derive(Clone)]
@@ -386,6 +387,42 @@ impl Database {
         Ok(row.get("count"))
     }
 
+    pub async fn axis_backfill_batch(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<AxisBackfillRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT url, title, summary, llm_novelty_json
+            FROM pages
+            WHERE llm_novelty_json IS NOT NULL
+            ORDER BY created_at ASC
+            LIMIT ?1
+            OFFSET ?2
+            "#,
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to fetch axis backfill batch")?;
+
+        rows.into_iter()
+            .map(|row| {
+                let json: String = row.get("llm_novelty_json");
+                let llm_novelty = serde_json::from_str(&json)
+                    .context("failed to parse llm_novelty_json for axis backfill")?;
+                Ok(AxisBackfillRecord {
+                    url: row.get("url"),
+                    title: row.get("title"),
+                    summary: row.get("summary"),
+                    llm_novelty,
+                })
+            })
+            .collect()
+    }
+
     pub async fn page_embedding_backfill_batch(
         &self,
         limit: i64,
@@ -468,6 +505,18 @@ impl Database {
             .execute(&self.pool)
             .await
             .with_context(|| format!("failed to update llm embedding for {url}"))?;
+        Ok(())
+    }
+
+    pub async fn update_llm_novelty(&self, url: &str, novelty: &LlmNovelty) -> Result<()> {
+        let llm_novelty_json =
+            serde_json::to_string(novelty).context("failed to serialize llm novelty update")?;
+        sqlx::query("UPDATE pages SET llm_novelty_json = ?2 WHERE url = ?1")
+            .bind(url)
+            .bind(llm_novelty_json)
+            .execute(&self.pool)
+            .await
+            .with_context(|| format!("failed to update llm novelty for {url}"))?;
         Ok(())
     }
 
@@ -617,6 +666,7 @@ fn row_to_page_record(row: sqlx::sqlite::SqliteRow) -> Result<PageRecord> {
 #[cfg(test)]
 mod tests {
     use super::Database;
+    use crate::models::{AxisScore, LlmNovelty};
 
     #[tokio::test]
     async fn snapshot_handles_sqlite_timestamps() {
@@ -678,6 +728,95 @@ mod tests {
 
         let _ = std::fs::remove_file(format!(
             "{}/db-snapshot-test-{}.sqlite",
+            std::env::temp_dir().display(),
+            std::process::id()
+        ));
+    }
+
+    #[tokio::test]
+    async fn update_llm_novelty_persists_axis_scores() {
+        let path = format!(
+            "sqlite://{}/db-axis-update-test-{}.sqlite?mode=rwc",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let database = Database::connect(&path).await.expect("connect database");
+
+        database
+            .enqueue_link("https://example.com", None, None, 0, 0.5)
+            .await
+            .expect("enqueue seed");
+
+        let entry = database
+            .claim_frontier_item()
+            .await
+            .expect("claim frontier item")
+            .expect("frontier item exists");
+
+        let digest = crate::models::PageDigest {
+            url: "https://example.com".to_string(),
+            domain: "example.com".to_string(),
+            title: "Example".to_string(),
+            clean_text: "Example page text".to_string(),
+            short_summary: "Example page text".to_string(),
+            key_points: Vec::new(),
+            entities: Vec::new(),
+            claims: Vec::new(),
+            outbound_links: Vec::new(),
+            boilerplate_ratio: 0.2,
+            content_hash: "hash".to_string(),
+        };
+        let score = crate::models::NoveltyScore {
+            food_energy: 0.5,
+            factual_novelty: 0.5,
+            entity_novelty: 0.4,
+            relational_novelty: 0.3,
+            temporal_novelty: 1.0,
+            expected_crawl_value: 0.5,
+            concise_reason: "test".to_string(),
+            likely_novel_aspects: Vec::new(),
+            likely_redundant_aspects: Vec::new(),
+            semantic_distance: 0.6,
+            new_token_ratio: 0.7,
+            local_graph_diversity: 0.1,
+            domain_redundancy: 0.0,
+            boilerplate_penalty: 0.2,
+        };
+        let novelty = LlmNovelty {
+            concise_reason: "initial".to_string(),
+            ..LlmNovelty::fallback()
+        };
+
+        database
+            .store_crawl_result(&entry, &digest, None, None, Some(&novelty), &score, &[])
+            .await
+            .expect("store crawl result");
+
+        let updated_novelty = LlmNovelty {
+            axis_scores: vec![AxisScore {
+                negative_label: "Isolationist".to_string(),
+                positive_label: "Expansionist".to_string(),
+                score: 0.75,
+                explanation: "The page argues for broader intervention.".to_string(),
+            }],
+            ..novelty
+        };
+
+        database
+            .update_llm_novelty("https://example.com", &updated_novelty)
+            .await
+            .expect("update llm novelty");
+
+        let pages = database.recent_pages(1).await.expect("read pages");
+        let stored = pages[0]
+            .llm_novelty
+            .as_ref()
+            .expect("stored llm novelty should exist");
+        assert_eq!(stored.axis_scores.len(), 1);
+        assert_eq!(stored.axis_scores[0].positive_label, "Expansionist");
+
+        let _ = std::fs::remove_file(format!(
+            "{}/db-axis-update-test-{}.sqlite",
             std::env::temp_dir().display(),
             std::process::id()
         ));

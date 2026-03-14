@@ -6,7 +6,7 @@ Defines runtime configuration for the crawler, LLM gateway, storage, and thresho
 ## Components
 
 ### `Config`
-- **Does**: Holds bind address, SQLite path, settings file path, crawl thresholds, fetch timeout, OpenAI-compatible model settings including a dedicated LLM timeout, and toggles for optional semantic-map embedding passes.
+- **Does**: Holds bind address, SQLite path, settings file path, crawl thresholds, fetch timeout, OpenAI-compatible model settings including a dedicated LLM timeout, toggles for optional semantic-map embedding passes, and up to three operator-defined semantic axes.
 - **Interacts with**: `run` in `app.rs`, `Crawler` in `crawler.rs`, `OpenAiCompatibleClient` in `llm.rs`, `SettingsManager` in `settings.rs`
 
 ### `Config::from_env`
@@ -17,7 +17,7 @@ Defines runtime configuration for the crawler, LLM gateway, storage, and thresho
 ### `EditableSettings`, `Config::to_editable`, `Config::apply_editable`
 - **Does**: Defines the dashboard-editable settings payload and converts it to runtime config.
 - **Interacts with**: `SettingsManager` in `settings.rs`, handlers in `ui.rs`
-- **Rationale**: Normalizes operator-entered LM Studio URLs so a bare host like `192.168.0.203:1234/v1` still becomes a valid HTTP base URL, lets model timeout differ from fetch timeout, rebases relative storage paths onto the executable directory, and makes the slower semantic-clustering paths explicit operator choices.
+- **Rationale**: Normalizes operator-entered LM Studio URLs so a bare host like `192.168.0.203:1234/v1` still becomes a valid HTTP base URL, lets model timeout differ from fetch timeout, rebases relative storage paths onto the executable directory, makes the slower semantic-clustering paths explicit operator choices, and keeps custom semantic axes bounded and normalized.
 - **Notes**: `EditableSettings` supports equality checks so the native UI can distinguish unsaved edits from the last persisted snapshot.
 
 ## Contracts

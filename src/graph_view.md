@@ -6,7 +6,7 @@ Owns the native 3D force-directed network viewport. It keeps graph layout, camer
 ## Components
 
 ### `GraphViewport`
-- **Does**: Synchronizes node physics with the latest crawl snapshot, runs a 3D force simulation, and renders the projected graph with switchable color/overlay modes for novelty, page semantics, and LLM-judgment semantics.
+- **Does**: Synchronizes node physics with the latest crawl snapshot, runs a 3D force simulation, and renders the projected graph with switchable color/overlay modes for novelty, page semantics, LLM-judgment semantics, and operator-defined axis projection.
 - **Interacts with**: `DashboardSnapshot` in `models.rs`, `HungerApp` in `ui.rs`
 - **Rationale**: Semantic modes now affect layout as well as color by adding attraction between resonance pairs and cluster-level anchoring forces.
 
@@ -15,7 +15,7 @@ Owns the native 3D force-directed network viewport. It keeps graph layout, camer
 - **Interacts with**: egui painter APIs
 
 ### `GraphColorMode`
-- **Does**: Encodes the operator-selected visual analysis mode so the viewport can swap palettes and semantic clustering behavior without changing the underlying graph layout.
+- **Does**: Encodes the operator-selected visual analysis mode so the viewport can swap palettes and semantic clustering behavior, including an `AXES` mode that projects nodes from stored LLM axis scores.
 - **Interacts with**: `HungerApp` in `ui.rs`
 
 ### `FieldTelemetry`

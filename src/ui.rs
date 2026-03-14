@@ -200,13 +200,15 @@ impl HungerApp {
             &self.context.runtime,
             self.context.database.clone(),
             self.context.settings.clone(),
+            self.context.control.clone(),
         );
         if started {
-            self.status_line = "Started semantic backfill.".to_string();
+            self.status_line =
+                "Started backfill pass. Crawler paused until it completes.".to_string();
             self.backfill_status.running = true;
             self.request_refresh();
         } else {
-            self.status_line = "Semantic backfill is already running.".to_string();
+            self.status_line = "Backfill is already running.".to_string();
         }
     }
 
@@ -382,6 +384,39 @@ impl HungerApp {
                     .size(11.0)
                     .color(Color32::from_rgb(109, 133, 153)),
             );
+            ui.add_space(8.0);
+            ui.label(field_label("Semantic Axes"));
+            for (index, axis) in self.editable_settings.semantic_axes.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("{:02}", index + 1))
+                            .monospace()
+                            .size(10.5)
+                            .color(Color32::from_rgb(109, 133, 153)),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut axis.negative_label)
+                            .hint_text("Left pole")
+                            .desired_width(120.0),
+                    );
+                    ui.label(
+                        RichText::new("<>")
+                            .monospace()
+                            .size(11.0)
+                            .color(Color32::from_rgb(188, 142, 255)),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut axis.positive_label)
+                            .hint_text("Right pole")
+                            .desired_width(120.0),
+                    );
+                });
+            }
+            ui.label(
+                RichText::new("configured axes are injected into the LLM prompt and drive the AXES projection mode")
+                    .size(11.0)
+                    .color(Color32::from_rgb(109, 133, 153)),
+            );
 
             ui.add_space(10.0);
             ui.horizontal(|ui| {
@@ -489,7 +524,12 @@ impl HungerApp {
                 let graph_height = (ui.available_height() * 0.57).max(320.0);
                 panel_frame(Color32::from_rgb(6, 9, 16)).show(ui, |ui| {
                     ui.set_height(graph_height);
-                    self.graph.draw(ui, &self.dashboard, self.graph_mode);
+                    self.graph.draw(
+                        ui,
+                        &self.dashboard,
+                        self.graph_mode,
+                        &configured_axes(&self.settings_snapshot.settings.semantic_axes),
+                    );
                 });
                 let telemetry = self.graph.telemetry();
 
@@ -540,7 +580,12 @@ impl HungerApp {
 impl eframe::App for HungerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_refresh();
-        if self.last_refresh.elapsed() >= Duration::from_millis(900) {
+        let refresh_interval = if self.backfill_status.running {
+            Duration::from_millis(1800)
+        } else {
+            Duration::from_millis(900)
+        };
+        if self.last_refresh.elapsed() >= refresh_interval {
             self.request_refresh();
             self.last_refresh = Instant::now();
         }
@@ -716,7 +761,7 @@ fn draw_backfill_status(ui: &mut egui::Ui, status: &BackfillStatus) {
 
     ui.horizontal_wrapped(|ui| {
         ui.label(
-            RichText::new("semantic backfill")
+            RichText::new("backfill")
                 .monospace()
                 .size(11.0)
                 .color(Color32::from_rgb(109, 133, 153)),
@@ -770,8 +815,8 @@ fn draw_backfill_status(ui: &mut egui::Ui, status: &BackfillStatus) {
 
 fn progress_label(status: &BackfillStatus) -> String {
     format!(
-        "page {}  llm {}",
-        status.page_processed, status.llm_processed
+        "page {}  llm {}  axes {}",
+        status.page_processed, status.llm_processed, status.axis_processed
     )
 }
 
@@ -794,6 +839,7 @@ fn draw_command_radar(ui: &mut egui::Ui, telemetry: &FieldTelemetry, status: &Ba
         GraphColorMode::Novelty => Color32::from_rgba_unmultiplied(255, 96, 96, 36),
         GraphColorMode::PageSemantic => Color32::from_rgba_unmultiplied(92, 225, 255, 42),
         GraphColorMode::JudgmentSemantic => Color32::from_rgba_unmultiplied(255, 176, 72, 44),
+        GraphColorMode::AxisProjection => Color32::from_rgba_unmultiplied(188, 142, 255, 44),
     };
 
     for factor in [0.25, 0.45, 0.68, 0.92] {
@@ -826,6 +872,8 @@ fn draw_command_radar(ui: &mut egui::Ui, telemetry: &FieldTelemetry, status: &Ba
         );
         let color = if telemetry.mode == GraphColorMode::JudgmentSemantic {
             Color32::from_rgb(255, 176, 72)
+        } else if telemetry.mode == GraphColorMode::AxisProjection {
+            Color32::from_rgb(188, 142, 255)
         } else {
             Color32::from_rgb(84, 214, 255)
         };
@@ -908,6 +956,14 @@ fn draw_command_radar(ui: &mut egui::Ui, telemetry: &FieldTelemetry, status: &Ba
             Color32::from_rgb(114, 229, 149)
         },
     );
+}
+
+fn configured_axes(axes: &[crate::models::SemanticAxis]) -> Vec<crate::models::SemanticAxis> {
+    axes.iter()
+        .filter(|axis| axis.is_configured())
+        .take(3)
+        .cloned()
+        .collect()
 }
 
 fn truncate(value: &str, max_chars: usize) -> String {
@@ -1018,6 +1074,29 @@ fn draw_page_card(ui: &mut egui::Ui, page: &PageRecord) {
                                 RichText::new(format!("- {aspect}"))
                                     .size(12.0)
                                     .color(Color32::from_rgb(190, 202, 214)),
+                            );
+                        }
+                    }
+
+                    if !llm.axis_scores.is_empty() {
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new("semantic axes")
+                                .monospace()
+                                .size(11.0)
+                                .color(Color32::from_rgb(188, 142, 255)),
+                        );
+                        for axis in llm.axis_scores.iter().take(3) {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} / {}  {:+.2}  {}",
+                                    axis.negative_label,
+                                    axis.positive_label,
+                                    axis.score,
+                                    axis.explanation
+                                ))
+                                .size(12.0)
+                                .color(Color32::from_rgb(214, 207, 244)),
                             );
                         }
                     }

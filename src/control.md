@@ -7,7 +7,7 @@ Provides lightweight runtime controls shared between the desktop UI and the craw
 
 ### `RuntimeControl`
 - **Does**: Stores the shared paused flag and exposes pause/resume/toggle helpers.
-- **Interacts with**: `Crawler` in `crawler.rs`, `HungerApp` in `ui.rs`
+- **Interacts with**: `Crawler` in `crawler.rs`, `HungerApp` in `ui.rs`, `BackfillController` in `backfill.rs`
 
 ## Contracts
 

@@ -15,7 +15,7 @@ Provides the native egui desktop application for inspecting the live crawl graph
 - **Rationale**: Keeps in-progress settings edits separate from the polled persisted snapshot so the refresh loop does not overwrite typed changes, and now polls snapshots asynchronously so long SQLite reads/writes do not freeze the egui thread.
 
 ### `HungerApp::draw_top_bar`, `draw_side_panel`, `draw_center`
-- **Does**: Splits the operator console into transport controls, graph analysis mode selection, semantic backfill controls, settings, graph viewport, and live lists.
+- **Does**: Splits the operator console into transport controls, graph analysis mode selection, backfill controls, settings including operator-defined semantic axes, graph viewport, and live lists.
 - **Interacts with**: egui panel/layout APIs
 - **Rationale**: Keeps the native UI structured so the graph work and crawler controls can evolve independently, including giving operators direct control over the slower LLM timeout and semantic-analysis cost toggles.
 
@@ -33,7 +33,10 @@ Provides the native egui desktop application for inspecting the live crawl graph
 
 ## Notes
 - The graph mode selector only changes the visual analysis layer; the underlying crawl graph and 3D force layout stay the same.
-- The semantic backfill button is intentionally separate from crawling so operators can retrofit old datasets without wiping the database or waiting for revisits.
+- The backfill button is intentionally separate from crawling so operators can retrofit old datasets without wiping the database or waiting for revisits, and it temporarily pauses the live crawler while the maintenance pass runs.
+- Backfill progress now reports page embeddings, LLM-response embeddings, and axis rescoring separately so operators can see which maintenance pass is running.
+- The `AXES` mode uses stored LLM axis scores, so new pages pick up placements during novelty scoring while older rows can now be repaired through the backfill path when axes are introduced or renamed.
+- Snapshot polling slows down while backfill is active so the native UI stays responsive even when SQLite and the LLM sidecar are busy.
 
 ## Contracts
 
